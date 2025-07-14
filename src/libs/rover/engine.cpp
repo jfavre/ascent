@@ -4,6 +4,7 @@
 // other details. No copyright assignment is required to contribute to Ascent.
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
+#include "vtkm_typedefs.hpp"
 #include <engine.hpp>
 #include <rover_exceptions.hpp>
 #include <utils/rover_logging.hpp>
@@ -40,15 +41,6 @@ Engine::validate_tracer()
 }
 
 void
-Engine::init()
-{
-  vtkmColorTable color_table(rover::settings["rover/color_table"].as_string());
-  set_color_map(color_table);
-  set_primary_field();
-  set_secondary_field();
-}
-
-void
 Engine::set_dataset(vtkm::cont::DataSet &dataset)
 {
   ROVER_INFO("Executing Engine::set_data_set");
@@ -56,60 +48,39 @@ Engine::set_dataset(vtkm::cont::DataSet &dataset)
   // TODO: Investigate why we set an empty field name here,
   // do we delete and replace the tracer later on or do we
   // explicitly set the field names?
-  m_tracer = new vtkm::rendering::ConnectivityProxy(dataset, "");
-  m_tracer->SetRenderMode(vtkm::rendering::ConnectivityProxy::RenderMode::Energy);
-  m_dataset = dataset;
-}
-
-void
-Engine::set_primary_field()
-{
-  const std::string absorption = rover::settings["rover/absorption"].as_string();
-  ROVER_INFO("Engine::set_primary_field: using '" << absorption << "'");
+  const std::string absorption = rover::settings["absorption"].as_string();
+  m_tracer = new vtkh::rendering::ConnectivityProxy(dataset, absorption);
   m_tracer->SetScalarField(absorption);
-}
-
-void
-Engine::set_secondary_field()
-{
-  std::string emission = rover::settings["rover/emission"].as_string();
-  // Return early if emission is not specified
-  if ("" == emission)
-  {
-    ROVER_INFO("Engine::set_secondary_field: emission not specified");
-    return;
-  }
-
-  ROVER_INFO("Engine::set_secondary_field: using '" << emission << "'");
-  m_tracer->SetEmissionField(emission);
+  m_dataset = dataset;
 }
 
 template<typename Precision>
 void
-Engine::init_emission(vtkm::rendering::raytracing::Ray<Precision> &rays,
+Engine::init_emission(vtkmRayTracing::Ray<Precision> &rays,
                       const int num_bins)
 {
-  const std::string emission = rover::settings["rover/emission"].as_string();
+  const std::string emission = rover::settings["emission"].as_string();
   // Return early if emission was not specified
-  if ("" == emission)
+  if (emission.empty())
   {
     ROVER_INFO("Engine::init_emission: emission not specified");
     return;
   }
-
+  m_tracer->SetEmissionField(emission);
   rays.AddBuffer(num_bins, "emission");
-  rays.GetBuffer("emission").InitConst(0);
+  rays.GetBuffer("emission").InitConst(0.0f);
 }
 
-PartialVector32
-Engine::partial_trace(Ray32 &rays)
+void
+Engine::partial_trace(Ray32 &rays, PartialVector32 &partials)
 {
   ROVER_INFO("Executing Engine::partial_trace");
   init_rays(rays);
-  m_tracer->SetUnitScalar(rover::settings["rover/unit_scalar"].value());
-  m_tracer->SetRenderMode(vtkm::rendering::ConnectivityProxy::RenderMode::Energy);
-  m_tracer->SetColorMap(m_color_map);
-  return m_tracer->PartialTrace(rays);
+  const bool divide_emis_by_absorb = rover::settings["divide_emis_by_absorb"].as_string() == "true";
+  m_tracer->SetDivideEmisByAbsorb(divide_emis_by_absorb);
+  const float64 unit_scalar = rover::settings["unit_scalar"].to_float64();
+  m_tracer->SetUnitScalar(unit_scalar);
+  m_tracer->PartialTrace(rays, partials);
 }
 
 void
@@ -118,8 +89,11 @@ Engine::init_rays(Ray32 &rays)
   validate_tracer();
   const int num_bins = get_num_channels();
   rays.Buffers.at(0).SetNumChannels(num_bins);
+  // TODO: I think this should be init with background intensities
   rays.Buffers.at(0).InitConst(1.0f);
   init_emission(rays, num_bins);
+  rays.AddBuffer(num_bins, "optical_depths");
+  rays.GetBuffer("optical_depths").InitConst(1.0f);
 }
 
 void
@@ -128,19 +102,20 @@ Engine::init_rays(Ray64 &rays)
   validate_tracer();
   const int num_bins = get_num_channels();
   rays.Buffers.at(0).SetNumChannels(num_bins);
+  // TODO: I think this should be init with background intensities
   rays.Buffers.at(0).InitConst(1.0f);
   init_emission(rays, num_bins);
+  rays.AddBuffer(num_bins, "optical_depths");
+  rays.GetBuffer("optical_depths").InitConst(1.0f);
 }
 
-PartialVector64
-Engine::partial_trace(Ray64 &rays)
+void
+Engine::partial_trace(Ray64 &rays, PartialVector64 &partials)
 {
   ROVER_INFO("Executing Engine::partial_trace");
   init_rays(rays);
-  m_tracer->SetUnitScalar(rover::settings["rover/unit_scalar"].value());
-  m_tracer->SetRenderMode(vtkm::rendering::ConnectivityProxy::RenderMode::Energy);
-  m_tracer->SetColorMap(m_color_map);
-  return m_tracer->PartialTrace(rays);
+  m_tracer->SetUnitScalar(rover::settings["unit_scalar"].value());
+  m_tracer->PartialTrace(rays, partials);
 }
 
 int
@@ -148,7 +123,7 @@ Engine::get_num_channels()
 {
   vtkm::Id absorption_size = 0;
   ArraySizeFunctor functor(&absorption_size);
-  const std::string absorption = rover::settings["rover/absorption"].as_string();
+  const std::string absorption = rover::settings["absorption"].as_string();
   m_dataset.GetField(absorption).
                       GetData().
                       CastAndCallForTypes<vtkm::TypeListAll, VTKM_DEFAULT_STORAGE_LIST>(functor);
@@ -202,31 +177,6 @@ Engine::set_composite_background(bool on)
   ROVER_INFO("Executing Engine::set_composite_background");
   validate_tracer();
   m_tracer->SetCompositeBackground(on);
-}
-
-void
-Engine::set_color_map(const vtkmColorTable &color_table, int samples)
-{
-  constexpr vtkm::Float32 conversionToFloatSpace = (1.0f / 255.0f);
-  vtkm::cont::ArrayHandle<vtkm::Vec<vtkm::UInt8, 4>> temp;
-
-  // TODO: Is this where num_samples was intended to be used?
-  // If so, we should query the settings here.
-
-  color_table.Sample(samples, temp);
-  m_color_map.Allocate(samples);
-  auto portal = m_color_map.WritePortal();
-  auto colorPortal = temp.ReadPortal();
-
-  for (vtkm::Id i = 0; i < samples; ++i)
-  {
-    auto color = colorPortal.Get(i);
-    vtkm::Vec<vtkm::Float32, 4> t(color[0] * conversionToFloatSpace,
-                                  color[1] * conversionToFloatSpace,
-                                  color[2] * conversionToFloatSpace,
-                                  color[3] * conversionToFloatSpace);
-    portal.Set(i, t);
-  }
 }
 
 }; //namespace rover

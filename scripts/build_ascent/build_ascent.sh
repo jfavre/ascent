@@ -352,7 +352,7 @@ if ${build_pyvenv}; then
     echo "**** Creating Python Virtual Env"
     cd ${install_dir} && ${python_exe} -m venv python-venv
     ${venv_python_exe} -m pip install --upgrade pip
-    ${venv_python_exe} -m pip install numpy sphinx sphinx_rtd_theme
+    ${venv_python_exe} -m pip install numpy sphinx sphinx_rtd_theme wheel
     if ${build_zfp}; then
         ${venv_python_exe} -m pip install cython setuptools
     fi
@@ -771,7 +771,7 @@ fi # build_camp
 ################
 # RAJA
 ################
-raja_version=v2025.03.1
+raja_version=v2025.03.2
 raja_src_dir=$(ospath ${source_dir}/RAJA-${raja_version})
 raja_build_dir=$(ospath ${build_dir}/raja-${raja_version})
 raja_install_dir=$(ospath ${install_dir}/raja-${raja_version}/)
