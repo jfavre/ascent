@@ -408,6 +408,7 @@ RoverXRay::verify_params(const conduit::Node &params,
     "camera/fov",
     "camera/look_at",
     "camera/near_plane",
+    "camera/position",
     "camera/up",
     "camera/xpan",
     "camera/ypan",
@@ -500,7 +501,7 @@ RoverXRay::execute()
   
   // Adding a dataset to rover resets the camera bounds to the dataset bounds,
   // but any camera params passed via the input params will take precedence.
-  // It also instantiates a scheduler if one doesn't already exist.
+  // It also instantiates one scheduler per MPI rank if they don't already exist.
   rover.add_dataset(dataset);
 
   // Calling execute initializes everything that rover needs based on the input params

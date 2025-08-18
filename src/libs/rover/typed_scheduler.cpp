@@ -5,7 +5,7 @@
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
 
 // rover includes
-#include "ray_generators/vtkm_ray_generator.hpp"
+#include "ray_generators/ray_generator.hpp"
 #include "settings.hpp"
 #include "vtkm_typedefs.hpp"
 #include <algorithm>
@@ -23,6 +23,7 @@ TypedScheduler<FloatType>::TypedScheduler()
   // a new scheduler, since we already instantiate it beforehand
   m_ray_generator = nullptr;
   m_num_local_domains = 0;
+  m_has_emission = rover::settings.has_child("emission");
 }
 
 #ifdef ROVER_PARALLEL
@@ -215,12 +216,11 @@ void
 TypedScheduler<FloatType>::composite()
 {
   // TODO: Combine AbsorptionPartial and EmissionPartial
-  const std::string emission = rover::settings["emission"].as_string();
-  if (!emission.empty())
+  if (m_has_emission)
   {
     typed_composite<vtkh::EmissionPartial<FloatType>>();
   }
-  else // (emission.empty())
+  else // (!m_has_emission)
   {
     typed_composite<vtkh::AbsorptionPartial<FloatType>>();
   }
@@ -316,20 +316,11 @@ TypedScheduler<FloatType>::trace_rays()
     throw RoverException("Error: ray generator must be set before execute is called");
   }
 
-  m_ray_generator->reset();
-
   set_global_range_and_bounds();
 
   vtkmTimer trace_timer;
   trace_timer.Start();
 
-  // TODO: Don't love that we need dynamic_cast
-  // TODO: Actually support both cases, vtkm and visit. Add tests
-  auto *cast_ray_generator = dynamic_cast<VtkmRayGenerator*>(m_ray_generator);
-  if (!cast_ray_generator)
-  {
-    throw RoverException("Error: RayGenerator instance must be a CameraGenerator");
-  }
   vtkmRayTracing::Ray<FloatType> rays;
 
   for (int i = 0; i < m_num_local_domains; i++)
@@ -343,12 +334,17 @@ TypedScheduler<FloatType>::trace_rays()
     vtkmLogger::GetInstance()->Clear();
 
     // Setting the coordinate system miminizes the number of rays generated
-    cast_ray_generator->set_coordinates(m_domains[i].get_dataset().GetCoordinateSystem());
+    m_ray_generator->set_coordinates(m_domains[i].get_dataset().GetCoordinateSystem());
     ROVER_INFO("Generating rays for domian " << i);
 
     timer.Start();
 
-    cast_ray_generator->get_rays(rays);
+    // TODO: I'm curious about which conditions can cause rays to fail to be created
+    if (!m_ray_generator->get_rays(rays))
+    {
+      ROVER_ERROR("Failed to create new rays");
+    }
+
     ROVER_INFO("Generated " << rays.NumRays << " rays");
     m_domains[i].init_rays(rays);
 
@@ -395,15 +391,14 @@ TypedScheduler<FloatType>::trace_rays()
   if (m_num_local_domains == 0 || m_partial_images.empty())
   {
     PartialImage<FloatType> partial_image;
-    partial_image.m_transmission =
-      vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
+    partial_image.m_transmission = vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
 
-    const std::string emission = rover::settings["emission"].as_string();
-    if (!emission.empty())
+    // Add an intensity buffer if the emission field is set
+    if (m_has_emission)
     {
-      partial_image.m_intensity =
-        vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
+      partial_image.m_intensity = vtkmRayTracing::ChannelBuffer<FloatType>(num_channels, 0);
     }
+
     m_partial_images.push_back(partial_image);
   }
 
@@ -888,13 +883,11 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   xray_view["far_plane"] = far_plane;
 
   Node &xray_query = state["xray_query"];
-  xray_query.set(rover::settings);
+  xray_query.update(rover::settings);
 
   Node &xray_data = state["xray_data"];
   xray_data["detector_width"] = detector_width; // TODO: Needs validation against VisIt
   xray_data["detector_height"] = detector_height; // TODO: Needs validation against VisIt
-  xray_data["intensity_max"];
-  xray_data["intensity_min"];
   xray_data["optical_depth_max"];
   xray_data["optical_depth_min"];
   xray_data["image_topo_order_of_domain_variables"] = "xyz";
@@ -940,39 +933,12 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   image_coords["units/y"] = "pixels";
   image_coords["units/z"] = "bins";
 
-  // if (m_render_settings.m_render_mode == energy) // removing volume renderer
-  // {
-
   // Topology
   Node &image_topo = topologies["image_topo"];
   image_topo["coordset"] = "image_coords";
   image_topo["type"] = "rectilinear";
 
-  if (!m_result.has_intensity(0) || !m_result.has_optical_depth(0))
-  {
-    ROVER_ERROR("intensity and optical depth must both be available")
-  }
-
-  // Fields
-  Node &intensities = fields["intensities"];
-  intensities["topology"] = "image_topo";
-  intensities["association"] = "element";
-  intensities["units"] = "intensity units";
-  vtkm::cont::ArrayHandle<FloatType> intensity_values = m_result.flatten_intensity_values();
-  FloatType *intensity_buffer = get_vtkm_ptr(intensity_values);
-  const int num_intensity_values = intensity_values.GetNumberOfValues();
-
-  auto intensity_min_max = std::minmax_element(intensity_buffer, intensity_buffer + num_intensity_values);
-  xray_data["intensity_max"].set(intensity_min_max.second);
-  xray_data["intensity_min"].set(intensity_min_max.first);
-  
-  intensities["values"].set(intensity_buffer, num_intensity_values);
-  intensities["strides"].set(DataType::int64(3));
-  int64_array strides = intensities["strides"].value();
-  strides[0] = 1;
-  strides[1] = image_width;
-  strides[2] = image_width * image_height;
-
+  // Image field
   Node &optical_depth = fields["optical_depth"];
   optical_depth["topology"] = "image_topo";
   optical_depth["association"] = "element";
@@ -986,7 +952,44 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   xray_data["optical_depth_min"].set(optical_min_max.first);
 
   optical_depth["values"].set(optical_buffer, num_optical_values);
-  optical_depth["strides"].set(intensities["strides"]);
+  optical_depth["strides"].set(DataType::int64(3));
+  int64_array strides = optical_depth["strides"].value();
+  strides[0] = 1;
+  strides[1] = image_width;
+  strides[2] = image_width * image_height;
+
+  // Spatial field
+  Node &optical_depth_spatial = fields["optical_depth_spatial"];
+  optical_depth_spatial.set(optical_depth);
+  optical_depth_spatial["topology"] = "spatial_topo";
+
+  // We only populate the intensities fields if the emission field was set
+  if (m_has_emission)
+  {
+    xray_data["intensity_max"];
+    xray_data["intensity_min"];
+
+    // Image field
+    Node &intensities = fields["intensities"];
+    intensities["topology"] = "image_topo";
+    intensities["association"] = "element";
+    intensities["units"] = "intensity units";
+    vtkm::cont::ArrayHandle<FloatType> intensity_values = m_result.flatten_intensity_values();
+    FloatType *intensity_buffer = get_vtkm_ptr(intensity_values);
+    const int num_intensity_values = intensity_values.GetNumberOfValues();
+  
+    auto intensity_min_max = std::minmax_element(intensity_buffer, intensity_buffer + num_intensity_values);
+    xray_data["intensity_max"].set(intensity_min_max.second);
+    xray_data["intensity_min"].set(intensity_min_max.first);
+    
+    intensities["values"].set(intensity_buffer, num_intensity_values);
+    intensities["strides"].set(strides);
+
+    // Spatial field
+    Node &intensities_spatial = fields["intensities_spatial"];
+    intensities_spatial.set(intensities);
+    intensities_spatial["topology"] = "spatial_topo";
+  }
 
   //
   // Spatial mesh
@@ -1030,15 +1033,6 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
   Node &spatial_topo = topologies["spatial_topo"];
   spatial_topo["coordset"] = "spatial_coords";
   spatial_topo["type"] = "rectilinear";
-
-  // Fields
-  Node &intensities_spatial = fields["intensities_spatial"];
-  intensities_spatial.set(intensities);
-  intensities_spatial["topology"] = "spatial_topo";
-
-  Node &optical_depth_spatial = fields["optical_depth_spatial"];
-  optical_depth_spatial.set(optical_depth);
-  optical_depth_spatial["topology"] = "spatial_topo";
 
   //
   // Near plane mesh
@@ -1119,8 +1113,6 @@ TypedScheduler<FloatType>::to_blueprint(Node &data)
                               left,
                               up);
   }
-
-  // } // removing volume renderer
 
   Node verify;
   if (!blueprint::verify("mesh", data, verify))
