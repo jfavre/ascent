@@ -306,6 +306,77 @@ GetExplicitCoordinateSystem(const conduit::Node &n_coords,
 
 }
 
+template<typename T>
+viskores::cont::CoordinateSystem
+GetRZCoordinateSystem(const conduit::Node &n_coords,
+                            const std::string &name,
+                            int &ndims,
+                            index_t &r_element_stride,
+                            index_t &z_element_stride,
+                            bool zero_copy)
+{
+    viskores::CopyFlag copy = viskores::CopyFlag::On;
+    if(zero_copy)
+    {
+      copy = viskores::CopyFlag::Off;
+    }
+      
+    int nverts = n_coords["values/r"].dtype().number_of_elements();
+
+    viskores::cont::ArrayHandle<T> r_coords_handle;
+    viskores::cont::ArrayHandle<T> z_coords_handle;
+    viskores::cont::ArrayHandle<T> theta_coords_handle;
+
+    ndims = 2;
+
+    if(r_element_stride == 1)
+    {
+      const T *r_verts_ptr = n_coords["values/r"].value();
+      detail::CopyArray(r_coords_handle, r_verts_ptr, nverts, zero_copy);
+    }
+    else
+    {
+      int r_verts_expanded = (nverts - 1) * r_element_stride + 1;
+      const T *r_verts_ptr = n_coords["values/r"].value();
+      viskores::cont::ArrayHandle<T> r_source_array = viskores::cont::make_ArrayHandle<T>(r_verts_ptr,
+                                                                                  r_verts_expanded,
+                                                                                  copy);
+      viskores::cont::ArrayHandleStride<T> r_stride_handle(r_source_array,
+                                                       nverts,
+                                                       r_element_stride,
+                                                       0); // offset
+
+      viskores::cont::Algorithm::Copy(r_stride_handle, r_coords_handle);
+    }
+
+    if(z_element_stride == 1)
+    {
+      const T *z_verts_ptr = n_coords["values/z"].value();
+      detail::CopyArray(z_coords_handle, z_verts_ptr, nverts, zero_copy);
+    }
+    else
+    {
+      int z_verts_expanded = (nverts - 1) * z_element_stride + 1;
+      const T *z_verts_ptr = n_coords["values/z"].value();
+      viskores::cont::ArrayHandle<T> z_source_array = viskores::cont::make_ArrayHandle<T>(z_verts_ptr,
+                                                                                  z_verts_expanded,
+                                                                                  copy);
+      viskores::cont::ArrayHandleStride<T> z_stride_handle(z_source_array,
+                                                       nverts,
+                                                       z_element_stride,
+                                                       0); // offset
+
+      viskores::cont::Algorithm::Copy(z_stride_handle, z_coords_handle);
+    }
+
+    theta_coords_handle.AllocateAndFill(nverts,0.0);
+
+    return viskores::cont::CoordinateSystem(name,
+                                    make_ArrayHandleSOA(z_coords_handle,
+                                                        r_coords_handle,
+                                                        theta_coords_handle));
+}
+
 
 template<typename T>
 viskores::cont::Field GetField(const conduit::Node &node,
@@ -1234,35 +1305,65 @@ VTKHDataAdapter::UniformBlueprintToViskoresDataSet
         is_2d = false;
     }
 
-
-
     float64 origin_x = 0.0;
     float64 origin_y = 0.0;
     float64 origin_z = 0.0;
-
 
     float64 spacing_x = 1.0;
     float64 spacing_y = 1.0;
     float64 spacing_z = 1.0;
 
+    const bool is_rz = (n_coords.has_child("origin") && (n_coords["origin"].has_child("r") || (n_coords["origin"].has_child("z") && is_2d))) ||
+                 (n_coords.has_child("spacing") && (n_coords["spacing"].has_child("dr") || (n_coords["spacing"].has_child("dz") && is_2d)));
+    const bool is_cartesian = (n_coords.has_child("origin") && (n_coords["origin"].has_child("x") || n_coords["origin"].has_child("y"))) ||
+                          (n_coords.has_child("spacing") && (n_coords["spacing"].has_child("dx") || n_coords["spacing"].has_child("dy"))) ||
+                          !is_rz;
+
+    if (is_rz && is_cartesian) {
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got parameters for both.")
+    }
+    
+    if (!is_rz && !is_cartesian)
+    {
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got neither.")
+    }
 
     if(n_coords.has_child("origin"))
     {
         const Node &n_origin = n_coords["origin"];
 
-        if(n_origin.has_child("x"))
+        if (is_cartesian)
         {
-            origin_x = n_origin["x"].to_float64();
-        }
+            if(n_origin.has_child("x"))
+            {
+                origin_x = n_origin["x"].to_float64();
+            }
 
-        if(n_origin.has_child("y"))
-        {
-            origin_y = n_origin["y"].to_float64();
-        }
+            if(n_origin.has_child("y"))
+            {
+                origin_y = n_origin["y"].to_float64();
+            }
 
-        if(n_origin.has_child("z"))
+            if(n_origin.has_child("z"))
+            {
+                origin_z = n_origin["z"].to_float64();
+            }
+        }
+        else if (is_rz && is_2d)
         {
-            origin_z = n_origin["z"].to_float64();
+            if(n_origin.has_child("z"))
+            {
+                origin_x = n_origin["z"].to_float64();
+            }
+
+            if(n_origin.has_child("r"))
+            {
+                origin_y = n_origin["r"].to_float64();
+            }
+        }
+        else if (is_rz && !is_2d)
+        {
+            ASCENT_ERROR("Unsupported coordset: cylindrical {r,z} coordinates only supported in 2d.")
         }
     }
 
@@ -1270,19 +1371,38 @@ VTKHDataAdapter::UniformBlueprintToViskoresDataSet
     {
         const Node &n_spacing = n_coords["spacing"];
 
-        if(n_spacing.has_path("dx"))
+        if (is_cartesian)
         {
-            spacing_x = n_spacing["dx"].to_float64();
-        }
+            if(n_spacing.has_path("dx"))
+            {
+                spacing_x = n_spacing["dx"].to_float64();
+            }
 
-        if(n_spacing.has_path("dy"))
-        {
-            spacing_y = n_spacing["dy"].to_float64();
-        }
+            if(n_spacing.has_path("dy"))
+            {
+                spacing_y = n_spacing["dy"].to_float64();
+            }
 
-        if(n_spacing.has_path("dz"))
+            if(n_spacing.has_path("dz"))
+            {
+                spacing_z = n_spacing["dz"].to_float64();
+            }
+        }
+        else if (is_rz && is_2d)
         {
-            spacing_z = n_spacing["dz"].to_float64();
+            if(n_spacing.has_path("dz"))
+            {
+                spacing_x = n_spacing["dz"].to_float64();
+            }
+
+            if(n_spacing.has_path("dr"))
+            {
+                spacing_y = n_spacing["dr"].to_float64();
+            }
+        }
+        else if (is_rz && !is_2d)
+        {
+            ASCENT_ERROR("Unsupported coordset: cylindrical {r,z} coordinates only supported in 2d.")
         }
     }
 
@@ -1296,15 +1416,26 @@ VTKHDataAdapter::UniformBlueprintToViskoresDataSet
                                        spacing_y,
                                        spacing_z);
 
-    viskores::Id3 dims(dims_i,
-                   dims_j,
-                   dims_k);
+    viskores::Id3 dims;
+    if(is_rz)
+    {
+        dims = viskores::Id3(dims_j,
+                    dims_i,
+                    dims_k);
+    }
+    else
+    {
+        dims = viskores::Id3(dims_i,
+                    dims_j,
+                    dims_k);
+    }
 
     // todo, use actually coordset and topo names?
     result->AddCoordinateSystem( viskores::cont::CoordinateSystem(coords_name.c_str(),
                                                               dims,
                                                               origin,
                                                               spacing));
+
     viskores::Id3 topo_origin = detail::topo_origin(n_topo);
     if(is_2d)
     {
@@ -1353,60 +1484,199 @@ VTKHDataAdapter::RectilinearBlueprintToViskoresDataSet
 {
     viskores::cont::DataSet *result = new viskores::cont::DataSet();
 
-    int x_npts = n_coords["values/x"].dtype().number_of_elements();
-    int y_npts = n_coords["values/y"].dtype().number_of_elements();
-    int z_npts = 0;
+    const bool is_rz = n_coords["values"].has_child("r") && n_coords["values"].has_child("z");
+    const bool is_cartesian = n_coords["values"].has_child("x") && n_coords["values"].has_child("y");
 
-    int32 ndims = 2;
-
-    if (zero_copy && 
-        (!n_coords["values/x"].dtype().is_float64() || 
-         !n_coords["values/y"].dtype().is_float64()))
+    if (is_rz && is_cartesian)
     {
-        ASCENT_INFO("Zero-copy requested, but either x or y coordinate data is not float64." <<
-                    "x type: " << n_coords["values/x"].dtype().name() << 
-                    ", y type: " << n_coords["values/y"].dtype().name() << 
-                    ". Turning zero-copy off.");
-        zero_copy = false;
-    }
-
-    const float64 *x_coords_ptr;
-    Node temp_x;
-    if (n_coords["values/x"].dtype().is_float64())
-    {
-        x_coords_ptr = n_coords["values/x"].as_float64_ptr();
-    }
-    else
-    {
-        n_coords["values/x"].to_float64_array(temp_x);
-        x_coords_ptr = temp_x.value();
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got parameters for both.")
     }
     
-    const float64 *y_coords_ptr;
-    Node temp_y;
-    if (n_coords["values/y"].dtype().is_float64())
+    if (!is_rz && !is_cartesian)
     {
-        y_coords_ptr = n_coords["values/y"].as_float64_ptr();
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got neither.")
+    }
+
+    if (is_cartesian)
+    {
+        if (zero_copy &&
+            (!n_coords["values/x"].dtype().is_float64() || 
+             !n_coords["values/y"].dtype().is_float64()))
+        {
+            ASCENT_INFO("Zero-copy requested, but either x or y coordinate data is not float64." <<
+                        "x type: " << n_coords["values/x"].dtype().name() << 
+                        ", y type: " << n_coords["values/y"].dtype().name() << 
+                        ". Turning zero-copy off.");
+            zero_copy = false;
+        }
+
+        int x_npts = n_coords["values/x"].dtype().number_of_elements();
+        int y_npts = n_coords["values/y"].dtype().number_of_elements();
+        int z_npts = 0;
+
+        const float64 *x_coords_ptr;
+        Node temp_x;
+        if (n_coords["values/x"].dtype().is_float64())
+        {
+            x_coords_ptr = n_coords["values/x"].as_float64_ptr();
+        }
+        else
+        {
+            n_coords["values/x"].to_float64_array(temp_x);
+            x_coords_ptr = temp_x.value();
+        }
+        
+        const float64 *y_coords_ptr;
+        Node temp_y;
+        if (n_coords["values/y"].dtype().is_float64())
+        {
+            y_coords_ptr = n_coords["values/y"].as_float64_ptr();
+        }
+        else
+        {
+            n_coords["values/y"].to_float64_array(temp_y);
+            y_coords_ptr = temp_y.value();
+        }
+
+        int32 ndims = 2;
+        const float64 *z_coords_ptr = NULL;
+        Node temp_z;
+        if(n_coords.has_path("values/z"))
+        {
+            if (zero_copy && !n_coords["values/z"].dtype().is_float64())
+            {
+                ASCENT_INFO("Zero-copy requested, but z coordinate data is " <<
+                            n_coords["values/z"].dtype().name() <<
+                            " not float64. Turning zero-copy off.");
+                zero_copy = false;
+            }
+            ndims = 3;
+            z_npts = n_coords["values/z"].dtype().number_of_elements();
+            if (n_coords["values/z"].dtype().is_float64())
+            {
+                z_coords_ptr = n_coords["values/z"].as_float64_ptr();
+            }
+            else
+            {
+                n_coords["values/z"].to_float64_array(temp_z);
+                z_coords_ptr = temp_z.value();
+            }
+        }
+
+        viskores::cont::ArrayHandle<viskores::Float64> x_coords_handle;
+        viskores::cont::ArrayHandle<viskores::Float64> y_coords_handle;
+        viskores::cont::ArrayHandle<viskores::Float64> z_coords_handle;
+
+        if(zero_copy)
+        {
+            x_coords_handle = viskores::cont::make_ArrayHandle(x_coords_ptr, x_npts, viskores::CopyFlag::Off);
+            y_coords_handle = viskores::cont::make_ArrayHandle(y_coords_ptr, y_npts, viskores::CopyFlag::Off);
+        }
+        else
+        {
+            x_coords_handle.Allocate(x_npts);
+            y_coords_handle.Allocate(y_npts);
+
+            viskores::Float64 *x = vtkh::GetVISKORESPointer(x_coords_handle);
+            memcpy(x, x_coords_ptr, sizeof(float64) * x_npts);
+            viskores::Float64 *y = vtkh::GetVISKORESPointer(y_coords_handle);
+            memcpy(y, y_coords_ptr, sizeof(float64) * y_npts);
+        }
+
+        if(ndims == 3)
+        {
+            if(zero_copy)
+            {
+                z_coords_handle = viskores::cont::make_ArrayHandle(z_coords_ptr, z_npts, viskores::CopyFlag::Off);
+            }
+            else
+            {
+                z_coords_handle.Allocate(z_npts);
+                viskores::Float64 *z = vtkh::GetVISKORESPointer(z_coords_handle);
+                memcpy(z, z_coords_ptr, sizeof(float64) * z_npts);
+            }
+        }
+        else
+        {
+            z_coords_handle.Allocate(1);
+            z_coords_handle.WritePortal().Set(0, 0.0);
+        }
+
+        static_assert(std::is_same<viskores::FloatDefault, double>::value,
+                    "Viskores needs to be configured with 'Viskores_USE_DOUBLE_PRECISION=ON'");
+        viskores::cont::ArrayHandleCartesianProduct<
+            viskores::cont::ArrayHandle<viskores::FloatDefault>,
+            viskores::cont::ArrayHandle<viskores::FloatDefault>,
+            viskores::cont::ArrayHandle<viskores::FloatDefault> > coords;
+
+        coords = viskores::cont::make_ArrayHandleCartesianProduct(x_coords_handle,
+                                                            y_coords_handle,
+                                                            z_coords_handle);
+
+        viskores::cont::CoordinateSystem coordinate_system(coords_name.c_str(), coords);
+        result->AddCoordinateSystem(coordinate_system);
+
+        viskores::Id3 topo_origin = detail::topo_origin(n_topo);
+
+        if (ndims == 2)
+        {
+            viskores::cont::CellSetStructured<2> cell_set;
+            cell_set.SetPointDimensions(viskores::make_Vec(x_npts,
+                                                        y_npts));
+            viskores::Id2 origin2(topo_origin[0], topo_origin[1]);
+            cell_set.SetGlobalPointIndexStart(origin2);
+            result->SetCellSet(cell_set);
+        }
+        else
+        {
+            viskores::cont::CellSetStructured<3> cell_set;
+            cell_set.SetPointDimensions(viskores::make_Vec(x_npts,
+                                                        y_npts,
+                                                        z_npts));
+            cell_set.SetGlobalPointIndexStart(topo_origin);
+            result->SetCellSet(cell_set);
+        }
+
+        nverts = x_npts * y_npts;
+        neles = (x_npts - 1) * (y_npts - 1);
+        if(ndims > 2)
+        {
+            nverts *= z_npts;
+            neles *= (z_npts - 1);
+        }
+
+        return result;
     }
     else
     {
-        n_coords["values/y"].to_float64_array(temp_y);
-        y_coords_ptr = temp_y.value();
-    }
-
-    const float64 *z_coords_ptr = NULL;
-    Node temp_z;
-    if(n_coords.has_path("values/z"))
-    {
-        if (zero_copy && !n_coords["values/z"].dtype().is_float64())
+        if (zero_copy &&
+            (!n_coords["values/r"].dtype().is_float64() || 
+            !n_coords["values/z"].dtype().is_float64()))
         {
-            ASCENT_INFO("Zero-copy requested, but z coordinate data is " <<
-                        n_coords["values/z"].dtype().name() <<
-                        " not float64. Turning zero-copy off.");
+            ASCENT_INFO("Zero-copy requested, but either r or z coordinate data is not float64." <<
+                        "r type: " << n_coords["values/r"].dtype().name() << 
+                        ", z type: " << n_coords["values/z"].dtype().name() << 
+                        ". Turning zero-copy off.");
             zero_copy = false;
         }
-        ndims = 3;
-        z_npts = n_coords["values/z"].dtype().number_of_elements();
+
+        int r_npts = n_coords["values/r"].dtype().number_of_elements();
+        int z_npts = n_coords["values/z"].dtype().number_of_elements();
+
+        const float64 *r_coords_ptr;
+        Node temp_r;
+        if (n_coords["values/r"].dtype().is_float64())
+        {
+            r_coords_ptr = n_coords["values/r"].as_float64_ptr();
+        }
+        else
+        {
+            n_coords["values/r"].to_float64_array(temp_r);
+            r_coords_ptr = temp_r.value();
+        }
+        
+        const float64 *z_coords_ptr;
+        Node temp_z;
         if (n_coords["values/z"].dtype().is_float64())
         {
             z_coords_ptr = n_coords["values/z"].as_float64_ptr();
@@ -1416,92 +1686,60 @@ VTKHDataAdapter::RectilinearBlueprintToViskoresDataSet
             n_coords["values/z"].to_float64_array(temp_z);
             z_coords_ptr = temp_z.value();
         }
+
+        viskores::cont::ArrayHandle<viskores::Float64> r_coords_handle;
+        viskores::cont::ArrayHandle<viskores::Float64> z_coords_handle;
+        viskores::cont::ArrayHandle<viskores::Float64> theta_coords_handle;
+
+        if(zero_copy)
+        {
+            r_coords_handle = viskores::cont::make_ArrayHandle(r_coords_ptr, r_npts, viskores::CopyFlag::Off);
+            z_coords_handle = viskores::cont::make_ArrayHandle(z_coords_ptr, z_npts, viskores::CopyFlag::Off);
+        }
+        else
+        {
+            r_coords_handle.Allocate(r_npts);
+            z_coords_handle.Allocate(z_npts);
+
+            viskores::Float64 *r = vtkh::GetVISKORESPointer(r_coords_handle);
+            memcpy(r, r_coords_ptr, sizeof(float64) * r_npts);
+            viskores::Float64 *z = vtkh::GetVISKORESPointer(z_coords_handle);
+            memcpy(z, z_coords_ptr, sizeof(float64) * z_npts);
+        }
+
+        theta_coords_handle.Allocate(1);
+        theta_coords_handle.WritePortal().Set(0, 0.0);
+
+        static_assert(std::is_same<viskores::FloatDefault, double>::value,
+                    "Viskores needs to be configured with 'Viskores_USE_DOUBLE_PRECISION=ON'");
+
+        viskores::cont::ArrayHandleCartesianProduct<
+            viskores::cont::ArrayHandle<viskores::FloatDefault>,
+            viskores::cont::ArrayHandle<viskores::FloatDefault>,
+            viskores::cont::ArrayHandle<viskores::FloatDefault> > coords;
+
+        coords = viskores::cont::make_ArrayHandleCartesianProduct(z_coords_handle,
+                                                                    r_coords_handle,
+                                                                    theta_coords_handle);
+
+        viskores::cont::CoordinateSystem coordinate_system(coords_name.c_str(), coords);
+
+        result->AddCoordinateSystem(coordinate_system);
+
+        viskores::Id3 topo_origin = detail::topo_origin(n_topo);
+
+        viskores::cont::CellSetStructured<2> cell_set;
+        cell_set.SetPointDimensions(viskores::make_Vec(z_npts,
+                                                    r_npts));
+        viskores::Id2 origin2(topo_origin[0], topo_origin[1]);
+        cell_set.SetGlobalPointIndexStart(origin2);
+        result->SetCellSet(cell_set);
+
+        nverts = r_npts * z_npts;
+        neles = (r_npts - 1) * (z_npts - 1);
+
+        return result;
     }
-
-    viskores::cont::ArrayHandle<viskores::Float64> x_coords_handle;
-    viskores::cont::ArrayHandle<viskores::Float64> y_coords_handle;
-    viskores::cont::ArrayHandle<viskores::Float64> z_coords_handle;
-
-    if(zero_copy)
-    {
-      x_coords_handle = viskores::cont::make_ArrayHandle(x_coords_ptr, x_npts, viskores::CopyFlag::Off);
-      y_coords_handle = viskores::cont::make_ArrayHandle(y_coords_ptr, y_npts, viskores::CopyFlag::Off);
-    }
-    else
-    {
-      x_coords_handle.Allocate(x_npts);
-      y_coords_handle.Allocate(y_npts);
-
-      viskores::Float64 *x = vtkh::GetVISKORESPointer(x_coords_handle);
-      memcpy(x, x_coords_ptr, sizeof(float64) * x_npts);
-      viskores::Float64 *y = vtkh::GetVISKORESPointer(y_coords_handle);
-      memcpy(y, y_coords_ptr, sizeof(float64) * y_npts);
-    }
-
-    if(ndims == 3)
-    {
-      if(zero_copy)
-      {
-        z_coords_handle = viskores::cont::make_ArrayHandle(z_coords_ptr, z_npts, viskores::CopyFlag::Off);
-      }
-      else
-      {
-        z_coords_handle.Allocate(z_npts);
-        viskores::Float64 *z = vtkh::GetVISKORESPointer(z_coords_handle);
-        memcpy(z, z_coords_ptr, sizeof(float64) * z_npts);
-      }
-    }
-    else
-    {
-        z_coords_handle.Allocate(1);
-        z_coords_handle.WritePortal().Set(0, 0.0);
-    }
-
-    static_assert(std::is_same<viskores::FloatDefault, double>::value,
-                  "Viskores needs to be configured with 'Viskores_USE_DOUBLE_PRECISION=ON'");
-    viskores::cont::ArrayHandleCartesianProduct<
-        viskores::cont::ArrayHandle<viskores::FloatDefault>,
-        viskores::cont::ArrayHandle<viskores::FloatDefault>,
-        viskores::cont::ArrayHandle<viskores::FloatDefault> > coords;
-
-    coords = viskores::cont::make_ArrayHandleCartesianProduct(x_coords_handle,
-                                                          y_coords_handle,
-                                                          z_coords_handle);
-
-    viskores::cont::CoordinateSystem coordinate_system(coords_name.c_str(),
-                                                  coords);
-    result->AddCoordinateSystem(coordinate_system);
-
-    viskores::Id3 topo_origin = detail::topo_origin(n_topo);
-
-    if (ndims == 2)
-    {
-      viskores::cont::CellSetStructured<2> cell_set;
-      cell_set.SetPointDimensions(viskores::make_Vec(x_npts,
-                                                 y_npts));
-      viskores::Id2 origin2(topo_origin[0], topo_origin[1]);
-      cell_set.SetGlobalPointIndexStart(origin2);
-      result->SetCellSet(cell_set);
-    }
-    else
-    {
-      viskores::cont::CellSetStructured<3> cell_set;
-      cell_set.SetPointDimensions(viskores::make_Vec(x_npts,
-                                                 y_npts,
-                                                 z_npts));
-      cell_set.SetGlobalPointIndexStart(topo_origin);
-      result->SetCellSet(cell_set);
-    }
-
-    nverts = x_npts * y_npts;
-    neles = (x_npts - 1) * (y_npts - 1);
-    if(ndims > 2)
-    {
-        nverts *= z_npts;
-        neles *= (z_npts - 1);
-    }
-
-    return result;
 }
 
 //-----------------------------------------------------------------------------
@@ -1519,61 +1757,117 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
     viskores::cont::DataSet *result = new viskores::cont::DataSet();
 
     string coords_type = n_coords["type"].as_string();
-    nverts = n_coords["values/x"].dtype().number_of_elements();
+    viskores::cont::CoordinateSystem coords;
     int ndims = 0;
 
-    viskores::cont::CoordinateSystem coords;
-    if(n_coords["values/x"].dtype().is_float64())
-    {
-      index_t x_stride = n_coords["values/x"].dtype().stride();
-      index_t x_element_stride = x_stride / sizeof(float64);
-      index_t y_stride = n_coords["values/y"].dtype().stride();
-      index_t y_element_stride = y_stride / sizeof(float64);
-      index_t z_element_stride = 0;
-      if(n_coords.has_path("values/z"))
-      {
-        index_t z_stride = n_coords["values/z"].dtype().stride();
-        z_element_stride = z_stride / sizeof(float64);
-      }
+    const bool is_rz = n_coords["values"].has_child("r") && n_coords["values"].has_child("z");
+    const bool is_cartesian = n_coords["values"].has_child("x") && n_coords["values"].has_child("y");
 
-      coords = detail::GetExplicitCoordinateSystem<float64>(n_coords,
-                                                            coords_name,
-                                                            ndims,
-                                                            x_element_stride,
-                                                            y_element_stride,
-                                                            z_element_stride,
-                                                            zero_copy);
+    if (is_rz && is_cartesian)
+    {
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got parameters for both.")
     }
-    else if(n_coords["values/x"].dtype().is_float32())
+    
+    if (!is_rz && !is_cartesian)
     {
-      index_t x_stride = n_coords["values/x"].dtype().stride();
-      index_t x_element_stride = x_stride / sizeof(float32);
-      index_t y_stride = n_coords["values/y"].dtype().stride();
-      index_t y_element_stride = y_stride / sizeof(float32);
-      index_t z_element_stride = 0;
-      if(n_coords.has_path("values/z"))
-      {
-        index_t z_stride = n_coords["values/z"].dtype().stride();
-        z_element_stride = z_stride / sizeof(float32);
-      }
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z} but got neither.")
+    }
 
-      coords = detail::GetExplicitCoordinateSystem<float32>(n_coords,
-                                                            coords_name,
-                                                            ndims,
-                                                            x_element_stride,
-                                                            y_element_stride,
-                                                            z_element_stride,
-                                                            zero_copy);
+    if (is_cartesian)
+    {
+        nverts = n_coords["values/x"].dtype().number_of_elements();
+        if(n_coords["values/x"].dtype().is_float64())
+        {
+            index_t x_stride = n_coords["values/x"].dtype().stride();
+            index_t x_element_stride = x_stride / sizeof(float64);
+            index_t y_stride = n_coords["values/y"].dtype().stride();
+            index_t y_element_stride = y_stride / sizeof(float64);
+            index_t z_element_stride = 0;
+            if(n_coords.has_path("values/z"))
+            {
+                index_t z_stride = n_coords["values/z"].dtype().stride();
+                z_element_stride = z_stride / sizeof(float64);
+            }
+
+            coords = detail::GetExplicitCoordinateSystem<float64>(n_coords,
+                                                                    coords_name,
+                                                                    ndims,
+                                                                    x_element_stride,
+                                                                    y_element_stride,
+                                                                    z_element_stride,
+                                                                    zero_copy);
+        }
+        else if(n_coords["values/x"].dtype().is_float32())
+        {
+            index_t x_stride = n_coords["values/x"].dtype().stride();
+            index_t x_element_stride = x_stride / sizeof(float32);
+            index_t y_stride = n_coords["values/y"].dtype().stride();
+            index_t y_element_stride = y_stride / sizeof(float32);
+            index_t z_element_stride = 0;
+            if(n_coords.has_path("values/z"))
+            {
+                index_t z_stride = n_coords["values/z"].dtype().stride();
+                z_element_stride = z_stride / sizeof(float32);
+            }
+
+            coords = detail::GetExplicitCoordinateSystem<float32>(n_coords,
+                                                                    coords_name,
+                                                                    ndims,
+                                                                    x_element_stride,
+                                                                    y_element_stride,
+                                                                    z_element_stride,
+                                                                    zero_copy);
+        }
+        else
+        {
+            ASCENT_ERROR("Coordinate system must be floating point values");
+        }
+    }
+    else if (n_coords["values"].has_child("r") && n_coords["values"].has_child("z"))
+    {
+        nverts = n_coords["values/r"].dtype().number_of_elements();
+        if(n_coords["values/r"].dtype().is_float64())
+        {
+            index_t r_stride = n_coords["values/r"].dtype().stride();
+            index_t r_element_stride = r_stride / sizeof(float64);
+            index_t z_stride = n_coords["values/z"].dtype().stride();
+            index_t z_element_stride = z_stride / sizeof(float64);
+            
+            coords = detail::GetRZCoordinateSystem<float64>(n_coords,
+                                                                coords_name,
+                                                                ndims,
+                                                                r_element_stride,
+                                                                z_element_stride,
+                                                                zero_copy);
+        }
+        else if(n_coords["values/r"].dtype().is_float32())
+        {
+            index_t r_stride = n_coords["values/r"].dtype().stride();
+            index_t r_element_stride = r_stride / sizeof(float32);
+            index_t z_stride = n_coords["values/z"].dtype().stride();
+            index_t z_element_stride = z_stride / sizeof(float32);
+
+            coords = detail::GetRZCoordinateSystem<float32>(n_coords,
+                                                                coords_name,
+                                                                ndims,
+                                                                r_element_stride,
+                                                                z_element_stride,
+                                                                zero_copy);
+        }
+        else
+        {
+            ASCENT_ERROR("Coordinate system must be floating point values");
+        }
     }
     else
     {
-      ASCENT_ERROR("Coordinate system must be floating point values");
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z}");
     }
 
     result->AddCoordinateSystem(coords);
 
-    int32 x_elems = n_topo["elements/dims/i"].to_int();
-    int32 y_elems = n_topo["elements/dims/j"].to_int();
+    int32 i_elems = n_topo["elements/dims/i"].to_int();
+    int32 j_elems = n_topo["elements/dims/j"].to_int();
 
     viskores::Id3 topo_origin = detail::topo_origin(n_topo);
 
@@ -1581,9 +1875,9 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
     {
       if(ndims == 2)
       {
-        viskores::Id x_verts = x_elems + 1;
-        viskores::Id y_verts = y_elems + 1;
-        neles = x_elems * y_elems;
+        viskores::Id x_verts = i_elems + 1;
+        viskores::Id y_verts = j_elems + 1;
+        neles = i_elems * j_elems;
         nverts = (x_verts) * (y_verts);
         
         std::string ele_shape = "quad";
@@ -1595,21 +1889,44 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
         auto conn_portal = connectivity.WritePortal();
         int offset = 0;
         // Build Connectivity 
-        for (viskores::Id i = 0; i < x_elems; ++i) 
+
+        if (is_rz)
         {
-          for (viskores::Id j = 0; j < y_elems; ++j) 
-          {
-            viskores::Id v0 = j * x_verts + i;
-            viskores::Id v1 = v0 + 1;
-            viskores::Id v2 = v0 + x_verts;
-            viskores::Id v3 = v0 + x_verts + 1;
-            
-            conn_portal.Set(offset, v0);// bottom left
-            conn_portal.Set(offset+1, v1); //bottom right
-            conn_portal.Set(offset+2, v3); //top right
-            conn_portal.Set(offset+3, v2); //top left 
-            offset = offset + 4;
-          }
+            for (viskores::Id j = 0; j < j_elems; ++j) 
+            {
+                for (viskores::Id i = 0; i < i_elems; ++i) 
+                {
+                    viskores::Id v0 = j * x_verts + i;
+                    viskores::Id v1 = v0 + 1;
+                    viskores::Id v2 = v0 + x_verts;
+                    viskores::Id v3 = v0 + x_verts + 1;
+                    
+                    conn_portal.Set(offset, v0);// bottom left
+                    conn_portal.Set(offset+1, v1); //bottom right
+                    conn_portal.Set(offset+2, v3); //top right
+                    conn_portal.Set(offset+3, v2); //top left 
+                    offset = offset + 4;
+                }
+            }
+        }
+        else
+        {
+            for (viskores::Id i = 0; i < i_elems; ++i) 
+            {
+                for (viskores::Id j = 0; j < j_elems; ++j) 
+                {
+                    viskores::Id v0 = j * x_verts + i;
+                    viskores::Id v1 = v0 + 1;
+                    viskores::Id v2 = v0 + x_verts;
+                    viskores::Id v3 = v0 + x_verts + 1;
+                    
+                    conn_portal.Set(offset, v0);// bottom left
+                    conn_portal.Set(offset+1, v1); //bottom right
+                    conn_portal.Set(offset+2, v3); //top right
+                    conn_portal.Set(offset+3, v2); //top left 
+                    offset = offset + 4;
+                }
+            }
         }
         viskores::cont::CellSetSingleType<> cell_set;
         cell_set.Fill(nverts, shape_id, indices_per, connectivity);
@@ -1618,12 +1935,12 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
       }
       else
       {
-        int32 z_elems = n_topo["elements/dims/k"].to_int();
+        int32 k_elems = n_topo["elements/dims/k"].to_int();
 
-        viskores::Id x_verts = x_elems + 1;
-        viskores::Id y_verts = y_elems + 1;
-        viskores::Id z_verts = z_elems + 1;
-        neles = x_elems * y_elems * z_elems;
+        viskores::Id x_verts = i_elems + 1;
+        viskores::Id y_verts = j_elems + 1;
+        viskores::Id z_verts = k_elems + 1;
+        neles = i_elems * j_elems * k_elems;
         nverts = (x_verts) * (y_verts) * (z_verts);
         
         std::string ele_shape = "hex";
@@ -1635,11 +1952,11 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
         auto conn_portal = connectivity.WritePortal();
         int offset = 0;
         // Build Connectivity (Polyhedral cells)
-        for (viskores::Id i = 0; i < x_elems; ++i) 
+        for (viskores::Id i = 0; i < i_elems; ++i) 
         {
-          for (viskores::Id j = 0; j < y_elems; ++j) 
+          for (viskores::Id j = 0; j < j_elems; ++j) 
           {
-            for (viskores::Id k = 0; k < z_elems; ++k) 
+            for (viskores::Id k = 0; k < k_elems; ++k) 
             {
               viskores::Id v0 = k * y_verts * x_verts + j * x_verts + i;
               viskores::Id v1 = v0 + 1;
@@ -1674,23 +1991,23 @@ VTKHDataAdapter::StructuredBlueprintToViskoresDataSet
       if (ndims == 2)
       {
         viskores::cont::CellSetStructured<2> cell_set;
-        cell_set.SetPointDimensions(viskores::make_Vec(x_elems+1,
-                                                   y_elems+1));
+        cell_set.SetPointDimensions(viskores::make_Vec(i_elems+1,
+                                                   j_elems+1));
         viskores::Id2 origin2(topo_origin[0], topo_origin[1]);
         cell_set.SetGlobalPointIndexStart(origin2);
         result->SetCellSet(cell_set);
-        neles = x_elems * y_elems;
+        neles = i_elems * j_elems;
       }
       else
       {
-        int32 z_elems = n_topo["elements/dims/k"].to_int();
+        int32 k_elems = n_topo["elements/dims/k"].to_int();
         viskores::cont::CellSetStructured<3> cell_set;
-        cell_set.SetPointDimensions(viskores::make_Vec(x_elems+1,
-                                                   y_elems+1,
-                                                   z_elems+1));
+        cell_set.SetPointDimensions(viskores::make_Vec(i_elems+1,
+                                                   j_elems+1,
+                                                   k_elems+1));
         cell_set.SetGlobalPointIndexStart(topo_origin);
         result->SetCellSet(cell_set);
-        neles = x_elems * y_elems * z_elems;
+        neles = i_elems * j_elems * k_elems;
       }
     }    
     return result;
@@ -1792,70 +2109,116 @@ VTKHDataAdapter::UnstructuredBlueprintToViskoresDataSet
      int &nverts,                    // output, number of verts
      bool zero_copy)                 // attempt to zero copy
 {
-
     viskores::cont::DataSet *result = new viskores::cont::DataSet();
 
-    nverts = n_coords["values/x"].dtype().number_of_elements();
-
-    int32 ndims;
     viskores::cont::CoordinateSystem coords;
-    if(n_coords["values/x"].dtype().is_float64())
-    {
-      index_t x_stride = n_coords["values/x"].dtype().stride();
-      index_t x_element_stride = x_stride / sizeof(float64);
-      index_t y_stride = n_coords["values/y"].dtype().stride();
-      index_t y_element_stride = y_stride / sizeof(float64);
-      index_t z_element_stride = 0;
-      if(n_coords.has_path("values/z"))
-      {
-        index_t z_stride = n_coords["values/z"].dtype().stride();
-        z_element_stride = z_stride / sizeof(float64);
-      }
+    int32 ndims;
 
-      //TODO:
-      //can we assume all by checking one? 
-      //or check ystride & zstride % float64 == 0? 
-      if(x_stride % sizeof(float64) == 0)
-      {
-        coords = detail::GetExplicitCoordinateSystem<float64>(n_coords,
-                                                              coords_name,
-                                                              ndims,
-                                                              x_element_stride,
-                                                              y_element_stride,
-                                                              z_element_stride,
-                                                              zero_copy);
-      }
+    if (n_coords["values"].has_child("x") && n_coords["values"].has_child("y"))
+    {
+        nverts = n_coords["values/x"].dtype().number_of_elements();
+        if(n_coords["values/x"].dtype().is_float64())
+        {
+            index_t x_stride = n_coords["values/x"].dtype().stride();
+            index_t x_element_stride = x_stride / sizeof(float64);
+            index_t y_stride = n_coords["values/y"].dtype().stride();
+            index_t y_element_stride = y_stride / sizeof(float64);
+            index_t z_element_stride = 0;
+            
+            if(n_coords.has_path("values/z"))
+            {
+                index_t z_stride = n_coords["values/z"].dtype().stride();
+                z_element_stride = z_stride / sizeof(float64);
+            }
+
+            if(x_stride % sizeof(float64) == 0)
+            {
+                coords = detail::GetExplicitCoordinateSystem<float64>(n_coords,
+                                                                    coords_name,
+                                                                    ndims,
+                                                                    x_element_stride,
+                                                                    y_element_stride,
+                                                                    z_element_stride,
+                                                                    zero_copy);
+            }
+        }
+        else if(n_coords["values/x"].dtype().is_float32())
+        {
+            index_t x_stride = n_coords["values/x"].dtype().stride();
+            index_t x_element_stride = x_stride / sizeof(float32);
+            index_t y_stride = n_coords["values/y"].dtype().stride();
+            index_t y_element_stride = y_stride / sizeof(float32);
+            index_t z_element_stride = 0;
+            if(n_coords.has_path("values/z"))
+            {
+                index_t z_stride = n_coords["values/z"].dtype().stride();
+                z_element_stride = z_stride / sizeof(float32);
+            }
+
+            //TODO:
+            //can we assume all by checking one? 
+            //or check ystride & zstride % float64 == 0? 
+            if(x_stride % sizeof(float32) == 0)
+            {
+                coords = detail::GetExplicitCoordinateSystem<float32>(n_coords,
+                                                                    coords_name,
+                                                                    ndims,
+                                                                    x_element_stride,
+                                                                    y_element_stride,
+                                                                    z_element_stride,
+                                                                    zero_copy);
+            }
+        }
+        else
+        {
+            ASCENT_ERROR("Coordinate system must be floating point values");
+        }
     }
-    else if(n_coords["values/x"].dtype().is_float32())
+    else if (n_coords["values"].has_child("r") && n_coords["values"].has_child("z"))
     {
-      index_t x_stride = n_coords["values/x"].dtype().stride();
-      index_t x_element_stride = x_stride / sizeof(float32);
-      index_t y_stride = n_coords["values/y"].dtype().stride();
-      index_t y_element_stride = y_stride / sizeof(float32);
-      index_t z_element_stride = 0;
-      if(n_coords.has_path("values/z"))
-      {
-        index_t z_stride = n_coords["values/z"].dtype().stride();
-        z_element_stride = z_stride / sizeof(float32);
-      }
+        nverts = n_coords["values/r"].dtype().number_of_elements();
+        if(n_coords["values/r"].dtype().is_float64())
+        {
+            index_t r_stride = n_coords["values/r"].dtype().stride();
+            index_t r_element_stride = r_stride / sizeof(float64);
+            index_t z_stride = n_coords["values/z"].dtype().stride();
+            index_t z_element_stride = z_stride / sizeof(float64);
 
-      //TODO:
-      //can we assume all by checking one? 
-      //or check ystride & zstride % float64 == 0? 
-      if(x_stride % sizeof(float32) == 0)
-      {
-        coords = detail::GetExplicitCoordinateSystem<float32>(n_coords,
-                                                              coords_name,
-                                                              ndims,
-                                                              x_element_stride,
-                                                              y_element_stride,
-                                                              z_element_stride,
-                                                              zero_copy);
-      }
+            if(r_stride % sizeof(float64) == 0)
+            {
+                coords = detail::GetRZCoordinateSystem<float64>(n_coords,
+                                                                coords_name,
+                                                                ndims,
+                                                                r_element_stride,
+                                                                z_element_stride,
+                                                                zero_copy);
+            }
+        }
+        else if(n_coords["values/r"].dtype().is_float32())
+        {
+            index_t r_stride = n_coords["values/r"].dtype().stride();
+            index_t r_element_stride = r_stride / sizeof(float32);
+            index_t z_stride = n_coords["values/z"].dtype().stride();
+            index_t z_element_stride = z_stride / sizeof(float32);
+
+            if(r_stride % sizeof(float64) == 0)
+            {
+                coords = detail::GetRZCoordinateSystem<float32>(n_coords,
+                                                                coords_name,
+                                                                ndims,
+                                                                r_element_stride,
+                                                                z_element_stride,
+                                                                zero_copy);
+            }
+        }
+        else
+        {
+            ASCENT_ERROR("Coordinate system must be floating point values");
+        }
     }
     else
     {
-      ASCENT_ERROR("Coordinate system must be floating point values");
+        ASCENT_ERROR("Unsupported coordset: expected cartesian {x,y,(z)} or cylindrical {r,z}");
     }
 
     result->AddCoordinateSystem(coords);
@@ -2610,125 +2973,515 @@ VTKHDataAdapter::AddVectorField(const std::string &field_name,
 
 }
 
+template <typename Id_T, typename Float_T>
+void AddMatSetFieldsCommon(const conduit::Node &matset,
+                           const std::string &length_name,
+                           const std::string &offsets_name,
+                           const std::string &ids_name,
+                           const std::string &vfs_name,
+                           const std::string &topo_name,
+                           int neles,
+                           viskores::cont::DataSet *dset)
+{
+    viskores::cont::Field length, offsets, ids, vfs;
+
+    detail::GetMatSetFields<Id_T, Float_T>(
+        matset,
+        length_name,
+        offsets_name,
+        ids_name,
+        vfs_name,
+        topo_name,
+        neles,
+        length,
+        offsets,
+        ids,
+        vfs);
+
+    dset->AddField(length);
+    dset->AddField(offsets);
+    dset->AddField(ids);
+    dset->AddField(vfs);
+}
+
+const conduit::Node &
+GetSparseByMaterialVfsSample(const conduit::Node &matset,
+                             const std::string   &matset_name)
+{
+    const conduit::Node &elem_ids = matset["element_ids"];
+    const conduit::Node &vf_group = matset["volume_fractions"];
+
+    const int num_ids       = elem_ids.number_of_children();
+    const int num_materials = vf_group.number_of_children();
+
+    if (num_ids == 0)
+    {
+        ASCENT_ERROR("No element ids were defined for matset: " << matset_name);
+    }
+
+    if (num_materials == 0)
+    {
+        ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
+    }
+
+    if (num_materials != num_ids)
+    {
+        ASCENT_ERROR("Number of materials (" << num_materials
+                     << ") does not match number of element IDs ("
+                     << num_ids << ") defined for matset: " << matset_name);
+    }
+
+    const conduit::Node &first_child = vf_group.child(0);
+    const int            child_count = first_child.number_of_children();
+
+    return (child_count != 0)
+           ? *first_child.child_ptr(0)
+           : *vf_group.child_ptr(0);
+}
+
 void
 VTKHDataAdapter::AddMatSets(const std::string &matset_name,
-                            const Node &n_matset,
+                            const conduit::Node &n_matset,
                             const std::string &topo_name,
                             int neles,
                             viskores::cont::DataSet *dset,
-                            bool zero_copy)                 // attempt to zero copy
+                            bool zero_copy)
 {
-
-    if(!n_matset.has_child("volume_fractions"))
-        ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
-    //TODO: zero_copy = true segfaulting in viskores mir filter
-    //zero_copy = false;
-    
-    
-    std::string assoc_str = "element";
-    //fields required from Viskores MIR filter
-    //std::string length_name, offsets_name, ids_name, vfs_name;
-    std::string length_name = "sizes";//matset_name + "_lengths";
-    std::string offsets_name = "offsets";//matset_name + "_offsets";
-    std::string ids_name = "material_ids";//matset_name + "_ids";
-    std::string vfs_name = "volume_fractions";//matset_name + "_vfs";
-    //matset is "sparse_by_element"
-    if(n_matset.has_child("material_map"))
+    // Common precondition: all matsets must have volume fractions.
+    if (!n_matset.has_child("volume_fractions"))
     {
-        try
+        ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
+    }
+
+    const bool use64BitIds = (sizeof(viskores::Id) == 8);
+
+    const std::string assoc_str = "element";
+    const std::string length_name = "sizes";
+    const std::string offsets_name = "offsets";
+    const std::string ids_name = "material_ids";
+    const std::string vfs_name = "volume_fractions";
+
+    // Helper: add an integer Node as a viskores::Id field, converting width if needed.
+    auto add_index_field_as_Id = [&](const conduit::Node &src, const std::string &name, const std::string &assoc)
+    {
+        const index_t n = static_cast<index_t>(src.dtype().number_of_elements());
+        const bool type_ok = ( use64BitIds && src.dtype().is_int64() ) || (!use64BitIds && src.dtype().is_int32());
+
+        if (type_ok)
         {
-            bool supported_type = false;
+            dset->AddField(
+                detail::GetField<viskores::Id>(src,
+                                               name,
+                                               assoc,
+                                               topo_name,
+                                               index_t(1),
+                                               zero_copy));
+            return;
+        }
 
-            // we compile vtk-h with fp types
-            if(n_matset["volume_fractions"].dtype().is_float32())
+        conduit::Node tmp;
+
+        if (use64BitIds && src.dtype().is_int32())
+        {
+            // 32 -> 64
+            tmp.set(conduit::DataType::int64(n));
+
+            const conduit::int32 *p32 = src.as_int32_ptr();
+            conduit::int64 *p64 = tmp.as_int64_ptr();
+
+            for (index_t i = 0; i < n; ++i)
             {
-                //add materials directly
-                const conduit::Node &n_length = n_matset["sizes"];
-                dset->AddField(detail::GetField<int>(n_length,
-                                                     length_name,
-                                                     assoc_str,
-                                                     topo_name,
-                                                     index_t(1),
-                                                     zero_copy));
-                const conduit::Node &n_offsets = n_matset["offsets"];
-                dset->AddField(detail::GetField<int>(n_offsets,
-                                                     offsets_name,
-                                                     assoc_str,
-                                                     topo_name,
-                                                     index_t(1),
-                                                     zero_copy));
-                const conduit::Node &n_material_ids = n_matset["material_ids"];
-                int num_vals = n_material_ids.dtype().number_of_elements();
-                if(n_material_ids.dtype().is_int32())
-                {
-                    const conduit::int32 *n_ids = n_material_ids.value();
-                    const vector<conduit::int32> vec_ids(n_ids, n_ids + num_vals);
-                    bool zeroes = std::any_of(vec_ids.begin(), vec_ids.end(), [](int value) { return value<=0; });
-                    if(zeroes) //need to make a copy and increment all material ids
-                    {
-                        conduit::Node n_mat_ids = n_matset["material_ids"];
-                        conduit::int32 *tmp_vec_ids = n_mat_ids.value();
-                        for(index_t i = 0; i < num_vals; ++i)
-                        {
-                            tmp_vec_ids[i] += 1.0; 
-                        }
-                        viskores::cont::Field field_copy = detail::GetField<int32>(n_mat_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               false);
-                        dset->AddField(field_copy);
-                    }
-                    else //can zero copy the material ids
-                    {
-                        viskores::cont::Field field_copy = detail::GetField<int32>(n_material_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               zero_copy);
+                p64[i] = static_cast<conduit::int64>(p32[i]);
+            }
+        }
+        else if (!use64BitIds && src.dtype().is_int64())
+        {
+            // 64 -> 32
+            tmp.set(conduit::DataType::int32(n));
 
-                        dset->AddField(field_copy);
+            const conduit::int64 *p64 = src.as_int64_ptr();
+            conduit::int32 *p32 = tmp.as_int32_ptr();
+
+            for (index_t i = 0; i < n; ++i)
+            {
+                p32[i] = static_cast<conduit::int32>(p64[i]);
+            }
+        }
+        else
+        {
+            ASCENT_ERROR("Unsupported integer type for index field '" << name << "'");
+        }
+
+        dset->AddField(detail::GetField<viskores::Id>(tmp,
+                                                      name,
+                                                      assoc,
+                                                      topo_name,
+                                                      index_t(1),
+                                                      false));
+    };
+
+    // ------------------------------------------------------------------------
+    // 64-bit ID path
+    // ------------------------------------------------------------------------
+    if (use64BitIds)
+    {
+        // --------------------------------------------------------------------
+        // Case 1: "sparse_by_element" / material_map
+        // --------------------------------------------------------------------
+        if (n_matset.has_child("material_map"))
+        {
+            try
+            {
+                // sizes and offsets as Id-type fields
+                const conduit::Node &n_sizes = n_matset["sizes"];
+                const conduit::Node &n_offsets = n_matset["offsets"];
+
+                add_index_field_as_Id(n_sizes, length_name, assoc_str);
+                add_index_field_as_Id(n_offsets, offsets_name, assoc_str);
+
+                // Material IDs: allow int32 or int64 in input, ensure > 0, then adapt to Id type
+                const conduit::Node &n_material_ids = n_matset["material_ids"];
+                const auto &id_dtype = n_material_ids.dtype();
+                const index_t num_vals = static_cast<index_t>(id_dtype.number_of_elements());
+
+                conduit::Node tmp_ids;
+                const conduit::Node *ids_src = &n_material_ids;
+
+                if (id_dtype.is_int32())
+                {
+                    const conduit::int32 *ids = n_material_ids.as_int32_ptr();
+                    const bool has_non_positive = std::any_of(ids, ids + num_vals, [](conduit::int32 v) { return v <= 0; });
+
+                    if (has_non_positive)
+                    {
+                        tmp_ids.set(n_material_ids);
+                        conduit::int32 *mutable_ids = tmp_ids.as_int32_ptr();
+                        for (index_t i = 0; i < num_vals; ++i)
+                        {
+                            mutable_ids[i] += 1;
+                        }
+                        ids_src = &tmp_ids;
                     }
                 }
-                else if(n_material_ids.dtype().is_int64())
+                else if (id_dtype.is_int64())
                 {
-                    const conduit::int64 *n_ids = n_material_ids.value();
-                    const vector<conduit::int64> vec_ids(n_ids, n_ids + num_vals);
-                    bool zeroes = std::any_of(vec_ids.begin(), vec_ids.end(), [](int value) { return value<=0; });
-                    if(zeroes) //need to make a copy and increment all material ids
-                    {
-                        conduit::Node n_mat_ids = n_matset["material_ids"];
-                        conduit::int64 *tmp_vec_ids = n_mat_ids.value();
-                        for(index_t i = 0; i < num_vals; ++i)
-                        {
-                            tmp_vec_ids[i] += 1.0; 
-                        }
-                        viskores::cont::Field field_copy = detail::GetField<int64>(n_mat_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               false);
-                        dset->AddField(field_copy);
-                    }
-                    else //can zero copy the material ids
-                    {
-                        viskores::cont::Field field_copy = detail::GetField<int64>(n_material_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               zero_copy);
+                    const conduit::int64 *ids = n_material_ids.as_int64_ptr();
+                    const bool has_non_positive = std::any_of(ids, ids + num_vals, [](conduit::int64 v) { return v <= 0; });
 
-                        dset->AddField(field_copy);
+                    if (has_non_positive)
+                    {
+                        tmp_ids.set(n_material_ids);
+                        conduit::int64 *mutable_ids = tmp_ids.as_int64_ptr();
+                        for (index_t i = 0; i < num_vals; ++i)
+                        {
+                            mutable_ids[i] += 1;
+                        }
+                        ids_src = &tmp_ids;
                     }
                 }
                 else
                 {
-                    ASCENT_ERROR("Unsupported integer type for material IDs");
+                    ASCENT_ERROR("Unsupported integer type for material IDs in matset: "
+                                 << matset_name);
                 }
+
+                // Now adapt material_ids (possibly shifted) to viskores::Id
+                add_index_field_as_Id(*ids_src, ids_name, "whole");
+
+                // Volume fractions: must be float32 or float64
+                const conduit::Node &n_vfs = n_matset["volume_fractions"];
+
+                if (n_vfs.dtype().is_float32())
+                {
+                    dset->AddField(detail::GetField<float32>(n_vfs,
+                                                            vfs_name,
+                                                            "whole",
+                                                            topo_name,
+                                                            index_t(1),
+                                                            zero_copy));
+                }
+                else if (n_vfs.dtype().is_float64())
+                {
+                    dset->AddField(detail::GetField<float64>(n_vfs,
+                                                            vfs_name,
+                                                            "whole",
+                                                            topo_name,
+                                                            index_t(1),
+                                                            zero_copy));
+                }
+                else
+                {
+                    ASCENT_ERROR("Unsupported floating-point type for volume_fractions in matset: "
+                                 << matset_name);
+                }
+            }
+            catch (const viskores::cont::Error &error)
+            {
+                ASCENT_ERROR("Viskores exception: " << error.GetMessage());
+            }
+        }
+        
+        // --------------------------------------------------------------------
+        // Case 2: "sparse_by_material" (element_ids)
+        // --------------------------------------------------------------------
+        else if (n_matset.has_child("element_ids"))
+        {
+            const conduit::Node &sample_vfs = GetSparseByMaterialVfsSample(n_matset, matset_name);
+
+            try
+            {
+                // Prepare matset with element_ids widened to int64 if needed
+                const conduit::Node *matset_for_fields = &n_matset;
+                conduit::Node matset_converted;
+
+                const conduit::Node &elem_ids_src = n_matset["element_ids"];
+
+                bool need_conversion = false;
+                const int num_elem_children = elem_ids_src.number_of_children();
+                for (int i = 0; i < num_elem_children; ++i)
+                {
+                    const conduit::Node &child = elem_ids_src.child(i);
+                    if (child.dtype().is_int32())
+                    {
+                        need_conversion = true;
+                        break;
+                    }
+                }
+
+                if (need_conversion)
+                {
+                    matset_converted.set(n_matset);
+                    conduit::Node &elem_ids_dst = matset_converted["element_ids"];
+
+                    for (int i = 0; i < elem_ids_dst.number_of_children(); ++i)
+                    {
+                        conduit::Node &child = elem_ids_dst.child(i);
+                        if (child.dtype().is_int32())
+                        {
+                            const index_t n = static_cast<index_t>(child.dtype().number_of_elements());
+
+                            conduit::Node tmp64;
+                            tmp64.set(conduit::DataType::int64(n));
+
+                            const conduit::int32 *src_ptr = child.as_int32_ptr();
+                            conduit::int64 *dst_ptr = tmp64.as_int64_ptr();
+
+                            for (index_t j = 0; j < n; ++j)
+                            {
+                                dst_ptr[j] = static_cast<conduit::int64>(src_ptr[j]);
+                            }
+
+                            // Replace the child array with the 64-bit version
+                            child.set(tmp64);
+                        }
+                    }
+
+                    matset_for_fields = &matset_converted;
+                }
+
+                if (sample_vfs.dtype().is_float32())
+                {
+                    AddMatSetFieldsCommon<viskores::Id, float32>(
+                        *matset_for_fields,
+                        length_name,
+                        offsets_name,
+                        ids_name,
+                        vfs_name,
+                        topo_name,
+                        neles,
+                        dset);
+                }
+                else if (sample_vfs.dtype().is_float64())
+                {
+                    AddMatSetFieldsCommon<viskores::Id, float64>(
+                        *matset_for_fields,
+                        length_name,
+                        offsets_name,
+                        ids_name,
+                        vfs_name,
+                        topo_name,
+                        neles,
+                        dset);
+                }
+                else
+                {
+                    ASCENT_ERROR("Unsupported floating-point type for sparse_by_material "
+                                 "volume_fractions in matset: " << matset_name);
+                }
+            }
+            catch (const viskores::cont::Error &error)
+            {
+                ASCENT_ERROR("Viskores exception: " << error.GetMessage());
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Case 3: "full" matset
+        // --------------------------------------------------------------------
+        else
+        {
+            const conduit::Node &vf_group = n_matset["volume_fractions"];
+            const int num_materials = vf_group.number_of_children();
+
+            if (num_materials == 0)
+            {
+                ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
+            }
+
+            const conduit::Node &first_material = vf_group.child(0);
+            const std::string material_name = first_material.name();
+            const index_t num_vals = static_cast<index_t>(first_material.dtype().number_of_elements());
+
+            if (num_vals != static_cast<index_t>(neles))
+            {
+                ASCENT_ERROR("Number of vf values "
+                             << num_vals
+                             << " for material "
+                             << material_name
+                             << " does not equal number of cells "
+                             << neles);
+            }
+
+            try
+            {
+                if (first_material.dtype().is_float32())
+                {
+                    AddMatSetFieldsCommon<viskores::Id, float32>(
+                        n_matset,
+                        length_name,
+                        offsets_name,
+                        ids_name,
+                        vfs_name,
+                        topo_name,
+                        neles,
+                        dset);
+                }
+                else if (first_material.dtype().is_float64())
+                {
+                    AddMatSetFieldsCommon<viskores::Id, float64>(
+                        n_matset,
+                        length_name,
+                        offsets_name,
+                        ids_name,
+                        vfs_name,
+                        topo_name,
+                        neles,
+                        dset);
+                }
+                else
+                {
+                    ASCENT_ERROR("Unsupported floating-point type for full matset "
+                                 "volume_fractions in matset: " << matset_name);
+                }
+            }
+            catch (const viskores::cont::Error &error)
+            {
+                ASCENT_ERROR("Viskores exception: " << error.GetMessage());
+            }
+        }
+
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 32-bit ID path
+    // ------------------------------------------------------------------------
+
+    //TODO: zero_copy = true segfaulting in viskores mir filter
+    //zero_copy = false;
+
+    // --------------------------------------------------------------------
+    // Case 1: "sparse_by_element" (material_map)
+    // --------------------------------------------------------------------
+    if (n_matset.has_child("material_map"))
+    {
+        try
+        {
+            // Add materials directly
+            const conduit::Node &n_length = n_matset["sizes"];
+            const conduit::Node &n_offsets = n_matset["offsets"];
+
+            add_index_field_as_Id(n_length, length_name, assoc_str);
+            add_index_field_as_Id(n_offsets, offsets_name, assoc_str);
+
+            const conduit::Node &n_material_ids = n_matset["material_ids"];
+            const int num_vals = n_material_ids.dtype().number_of_elements();
+
+            if (n_material_ids.dtype().is_int32())
+            {
+                const conduit::int32 *ids = n_material_ids.value();
+                const bool has_non_positive = std::any_of(ids, ids + num_vals, [](conduit::int32 v) { return v <= 0; });
+
+                if (has_non_positive) // need to make a copy and increment all material ids
+                {
+                    conduit::Node n_mat_ids = n_matset["material_ids"];
+                    conduit::int32 *tmp_vec_ids = n_mat_ids.value();
+
+                    for (index_t i = 0; i < num_vals; ++i)
+                    {
+                        tmp_vec_ids[i] += 1;
+                    }
+
+                    viskores::cont::Field field_copy = detail::GetField<int32>(n_mat_ids,
+                                                                               ids_name,
+                                                                               "whole",
+                                                                               topo_name,
+                                                                               index_t(1),
+                                                                               false);
+                    dset->AddField(field_copy);
+                }
+                else // can zero copy the material ids
+                {
+                    viskores::cont::Field field_copy = detail::GetField<int32>(n_material_ids,
+                                                                               ids_name,
+                                                                               "whole",
+                                                                               topo_name,
+                                                                               index_t(1),
+                                                                               zero_copy);
+
+                    dset->AddField(field_copy);
+                }
+            }
+            else if (n_material_ids.dtype().is_int64())
+            {
+                const conduit::int64 *ids = n_material_ids.value();
+                const bool has_non_positive = std::any_of(ids, ids + num_vals, [](conduit::int64 v) { return v <= 0; });
+
+                if (has_non_positive) // need to make a copy and increment all material ids
+                {
+                    conduit::Node n_mat_ids = n_matset["material_ids"];
+                    conduit::int64 *tmp_vec_ids = n_mat_ids.value();
+
+                    for (index_t i = 0; i < num_vals; ++i)
+                    {
+                        tmp_vec_ids[i] += 1;
+                    }
+
+                    viskores::cont::Field field_copy = detail::GetField<int64>(n_mat_ids,
+                                                                               ids_name,
+                                                                               "whole",
+                                                                               topo_name,
+                                                                               index_t(1),
+                                                                               false);
+                    dset->AddField(field_copy);
+                }
+                else // can zero copy the material ids
+                {
+                    dset->AddField(detail::GetField<int64>(n_material_ids,
+                                                           ids_name,
+                                                           "whole",
+                                                           topo_name,
+                                                           index_t(1),
+                                                           zero_copy));
+                }
+            }
+            else
+            {
+                ASCENT_ERROR("Unsupported integer type for material IDs");
+            }
+
+            if (n_matset["volume_fractions"].dtype().is_float32())
+            {
                 const conduit::Node &n_volume_fractions = n_matset["volume_fractions"];
                 dset->AddField(detail::GetField<float32>(n_volume_fractions,
                                                          vfs_name,
@@ -2736,97 +3489,9 @@ VTKHDataAdapter::AddMatSets(const std::string &matset_name,
                                                          topo_name,
                                                          index_t(1),
                                                          zero_copy));
-                supported_type = true;
             }
-            else if(n_matset["volume_fractions"].dtype().is_float64())
+            else if (n_matset["volume_fractions"].dtype().is_float64())
             {
-                //add materials directly
-                const Node &n_length = n_matset["sizes"];
-                dset->AddField(detail::GetField<int>(n_length,
-                                                     length_name,
-                                                     assoc_str,
-                                                     topo_name,
-                                                     index_t(1),
-                                                     zero_copy));
-                const conduit::Node &n_offsets = n_matset["offsets"];
-                dset->AddField(detail::GetField<int>(n_offsets,
-                                                     offsets_name,
-                                                     assoc_str,
-                                                     topo_name,
-                                                     index_t(1),
-                                                     zero_copy));
-                const conduit::Node &n_material_ids = n_matset["material_ids"];
-                int num_vals = n_material_ids.dtype().number_of_elements(); 
-                if(n_material_ids.dtype().is_int32())
-                {
-                    const conduit::int32 *n_ids = n_material_ids.value();
-                    const vector<conduit::int32> vec_ids(n_ids, n_ids + num_vals);
-                    bool zeroes = std::any_of(vec_ids.begin(), vec_ids.end(), [](int value) { return value<=0; });
-                    if(zeroes) //need to make a copy and increment all material ids
-                    {
-                        conduit::Node n_mat_ids = n_matset["material_ids"];
-                        conduit::int32 *tmp_vec_ids = n_mat_ids.value();
-                        for(index_t i = 0; i < num_vals; ++i)
-                        {
-                            tmp_vec_ids[i] += 1.0; 
-                        }
-                        viskores::cont::Field field_copy = detail::GetField<int32>(n_mat_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               false);
-                        dset->AddField(field_copy);
-                    }
-                    else //can zero copy the material ids
-                    {
-                        viskores::cont::Field field_copy = detail::GetField<int32>(n_material_ids,
-                                                                               ids_name,
-                                                                               "whole",
-                                                                               topo_name,
-                                                                               index_t(1),
-                                                                               zero_copy);
-
-                        dset->AddField(field_copy);
-                    }
-                }
-                else if(n_material_ids.dtype().is_int64())
-                {
-                    const conduit::int64 *n_ids = n_material_ids.value();
-                    const vector<conduit::int64> vec_ids(n_ids, n_ids + num_vals);
-                    bool zeroes = std::any_of(vec_ids.begin(), vec_ids.end(), [](int value) { return value<=0; });
-                    if(zeroes) //need to make a copy and increment all material ids
-                    {
-                      conduit::Node n_mat_ids = n_matset["material_ids"];
-                      conduit::int64 *tmp_vec_ids = n_mat_ids.value();
-                      for(index_t i = 0; i < num_vals; ++i)
-                      {
-                        tmp_vec_ids[i] += 1.0; 
-                      }
-                      viskores::cont::Field field_copy = detail::GetField<int64>(n_mat_ids,
-                                                                             ids_name,
-                                                                             "whole",
-                                                                             topo_name,
-                                                                             index_t(1),
-                                                                             false);
-                      dset->AddField(field_copy);
-                    }
-                    else //can zero copy the material ids
-                    {
-                      viskores::cont::Field field_copy = detail::GetField<int64>(n_material_ids,
-                                                                             ids_name,
-                                                                             "whole",
-                                                                             topo_name,
-                                                                             index_t(1),
-                                                                             zero_copy);
-
-                      dset->AddField(field_copy);
-                    }
-                }
-                else
-                {
-                    ASCENT_ERROR("Unsupported integer type for material IDs");
-                }
                 const conduit::Node &n_volume_fractions = n_matset["volume_fractions"];
                 dset->AddField(detail::GetField<float64>(n_volume_fractions,
                                                          vfs_name,
@@ -2834,178 +3499,111 @@ VTKHDataAdapter::AddMatSets(const std::string &matset_name,
                                                          topo_name,
                                                          index_t(1),
                                                          zero_copy));
-                supported_type = true;
             }
         }
-        catch (viskores::cont::Error error)
+        catch (const viskores::cont::Error &error)
         {
             ASCENT_ERROR("Viskores exception:" << error.GetMessage());
         }
-
     }
-    else if(n_matset.has_child("element_ids"))//matset is "sparse_by_material"
-    {
-        int num_ids = n_matset["element_ids"].number_of_children();
-        if(num_ids == 0)
-        {
-            ASCENT_ERROR("No element ids were defined for matset: " << matset_name);
-        }
 
-        int num_materials = n_matset["volume_fractions"].number_of_children();
-        if(num_materials == 0)
-        {
-            ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
-        }
-        
-        if(num_materials != num_ids)
-        {
-            ASCENT_ERROR("Number of materials (" << num_materials << 
-                         ") does not match number of elment IDs(" << num_ids << 
-                         " defined for matset: " << matset_name);
-        }
+    // --------------------------------------------------------------------
+    // Case 2: "sparse_by_material" (element_ids)
+    // --------------------------------------------------------------------
+    else if (n_matset.has_child("element_ids"))
+    {
+        const conduit::Node &sample_vfs = GetSparseByMaterialVfsSample(n_matset, matset_name);
 
         try
         {
-            bool supported_type = false;
-
-            const conduit::Node *n_vfs; //= n_matset["volume_fractions"].child(0);
-            const conduit::Node &tmp_vfs = n_matset["volume_fractions"].child(0);
-            int num_children = tmp_vfs.number_of_children();
-
-            if(num_children != 0) //of == 1?  
+            if (sample_vfs.dtype().is_float32())
             {
-              n_vfs = tmp_vfs.child_ptr(0);
+                AddMatSetFieldsCommon<int, float32>(
+                    n_matset,
+                    length_name,
+                    offsets_name,
+                    ids_name,
+                    vfs_name,
+                    topo_name,
+                    neles,
+                    dset);
             }
-            else
+            else if (sample_vfs.dtype().is_float64())
             {
-              n_vfs = n_matset["volume_fractions"].child_ptr(0);
-
-            }
-
-            // we compile vtk-h with fp types
-            if(n_vfs->dtype().is_float32())
-            {
-                supported_type = true;
-                //add calculated material fields for viskores
-                viskores::cont::Field length, offsets, ids, vfs;
-                detail::GetMatSetFields<int,float32>(n_matset, 
-                                                     length_name, 
-                                                     offsets_name, 
-                                                     ids_name,
-                                                     vfs_name,
-                                                     topo_name, 
-                                                     neles, 
-                                                     length, 
-                                                     offsets,
-                                                     ids,
-                                                     vfs);
-                dset->AddField(length);
-                dset->AddField(offsets);
-                dset->AddField(ids);
-                dset->AddField(vfs);
-            }
-            else if(n_vfs->dtype().is_float64())
-            {
-                supported_type = true;
-                //add calculated material fields for viskores
-                viskores::cont::Field length, offsets, ids, vfs;
-                detail::GetMatSetFields<int,float64>(n_matset, 
-                                                     length_name, 
-                                                     offsets_name, 
-                                                     ids_name,
-                                                     vfs_name,
-                                                     topo_name, 
-                                                     neles, 
-                                                     length, 
-                                                     offsets,
-                                                     ids,
-                                                     vfs);
-                dset->AddField(length);
-                dset->AddField(offsets);
-                dset->AddField(ids);
-                dset->AddField(vfs);
+                AddMatSetFieldsCommon<int, float64>(
+                    n_matset,
+                    length_name,
+                    offsets_name,
+                    ids_name,
+                    vfs_name,
+                    topo_name,
+                    neles,
+                    dset);
             }
         }
-        catch (viskores::cont::Error error)
+        catch (const viskores::cont::Error &error)
         {
             ASCENT_ERROR("Viskores exception:" << error.GetMessage());
         }
     }
-    else //matset is "full"
+
+    // --------------------------------------------------------------------
+    // Case 3: "full" matset
+    // --------------------------------------------------------------------
+    else
     {
         int num_materials = n_matset["volume_fractions"].number_of_children();
-        if(num_materials == 0)
+        if (num_materials == 0)
+        {
             ASCENT_ERROR("No volume fractions were defined for matset: " << matset_name);
+        }
 
-        const Node n_material = n_matset["volume_fractions"].child(0);
+        const conduit::Node &n_material = n_matset["volume_fractions"].child(0);
         std::string material_name = n_material.name();
-
         int num_vals = n_material.dtype().number_of_elements();
 
-        if(num_vals != neles )
+        if (num_vals != neles)
         {
-            ASCENT_ERROR("Number of vf values " 
-                          << num_vals 
-                          << " for material " 
-                          << material_name 
-                          << " does not equal number of cells "
-                          << neles);
+            ASCENT_ERROR("Number of vf values "
+                         << num_vals
+                         << " for material "
+                         << material_name
+                         << " does not equal number of cells "
+                         << neles);
         }
+
         try
         {
-            bool supported_type = false;
-
-            // we compile vtk-h with fp types
-            if(n_material.dtype().is_float32())
+            if (n_material.dtype().is_float32())
             {
-                supported_type = true;
-                //add calculated material fields for viskores
-                int total;
-                viskores::cont::Field length, offsets, ids, vfs;
-                detail::GetMatSetFields<int,float32>(n_matset, 
-                                                     length_name, 
-                                                     offsets_name, 
-                                                     ids_name,
-                                                     vfs_name,
-                                                     topo_name, 
-                                                     neles, 
-                                                     length, 
-                                                     offsets,
-                                                     ids,
-                                                     vfs);
-                dset->AddField(length);
-                dset->AddField(offsets);
-                dset->AddField(ids);
-                dset->AddField(vfs);
+                AddMatSetFieldsCommon<int, float32>(
+                    n_matset,
+                    length_name,
+                    offsets_name,
+                    ids_name,
+                    vfs_name,
+                    topo_name,
+                    neles,
+                    dset);
             }
-            else if(n_material.dtype().is_float64())
+            else if (n_material.dtype().is_float64())
             {
-                supported_type = true;
-                //add calculated material fields for viskores
-                int total;
-                viskores::cont::Field length, offsets, ids, vfs;
-                detail::GetMatSetFields<int,float64>(n_matset, 
-                                                     length_name, 
-                                                     offsets_name, 
-                                                     ids_name,
-                                                     vfs_name,
-                                                     topo_name, 
-                                                     neles, 
-                                                     length, 
-                                                     offsets,
-                                                     ids,
-                                                     vfs);
-                dset->AddField(length);
-                dset->AddField(offsets);
-                dset->AddField(ids);
-                dset->AddField(vfs);
+                AddMatSetFieldsCommon<int, float64>(
+                    n_matset,
+                    length_name,
+                    offsets_name,
+                    ids_name,
+                    vfs_name,
+                    topo_name,
+                    neles,
+                    dset);
             }
         }
-        catch (viskores::cont::Error error)
+        catch (const viskores::cont::Error &error)
         {
             ASCENT_ERROR("Viskores exception:" << error.GetMessage());
         }
-    }   
+    }
 }
 
 std::string
