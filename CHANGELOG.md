@@ -16,6 +16,7 @@ and this project aspires to adhere to [Semantic Versioning](https://semver.org/s
 - mfem@4.8
 
 ### Added
+- Added plane to the Sample Filter
 - Added the ability to specify "min/max" as the x/y/z point for the reflect transform filter
 - Added Uniform Grid filter as a parameter of the Sample Filter
 - Added ability to define cameras for rendering using visit camera view parameters
@@ -26,6 +27,7 @@ and this project aspires to adhere to [Semantic Versioning](https://semver.org/s
 
 ### Fixed
 - Fixed issue where the plot did not align with the 3d axes when the camera was panned (`camera/xpan` and `camera/ypan`).
+- Fixed a crash with PNG encoding of large renders (10k+ by 10k+ resolution)
 
 ## [0.9.5] - Released 2025-09-10
 ### Preferred dependency versions for ascent@0.9.5
